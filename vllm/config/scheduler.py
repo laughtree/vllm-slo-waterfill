@@ -18,8 +18,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
-PreemptionVictimPolicy = Literal["tail", "priority"]
+SchedulerPolicy = Literal["fcfs", "priority", "waterfill"]
+PreemptionVictimPolicy = Literal["tail", "priority", "satisfaction"]
 
 
 @config
@@ -165,7 +165,13 @@ class SchedulerConfig:
     - "fcfs" means first come first served, i.e. requests are handled in order
       of arrival.
     - "priority" means requests are handled based on given priority (lower
-      value means earlier handling) and time of arrival deciding any ties)."""
+      value means earlier handling) and time of arrival deciding any ties).
+    - "waterfill" serves the request furthest below its SLO output rate first,
+      by ascending satisfaction ratio (see `Request.satisfaction_ratio`). Both
+      the running requests and the waiting queue are ordered by it, so the
+      token budget fills the lowest ratios first. A request declares its SLO
+      with `vllm_xargs={"target_rate": <tokens/s>}`; one without it is served
+      last. Defaults to `preemption_victim_policy="satisfaction"`."""
 
     preemption_victim_policy: PreemptionVictimPolicy | None = None
     """Which running request is preempted when a request needs more KV-cache
@@ -176,7 +182,12 @@ class SchedulerConfig:
       default for `policy="fcfs"`.
     - "priority" preempts the running request with the lowest priority (highest
       priority value), with the latest arrival time deciding any ties. This is
-      the default for `policy="priority"`."""
+      the default for `policy="priority"`.
+    - "satisfaction" preempts the running request with the largest satisfaction
+      ratio, i.e. the one furthest ahead of its SLO output rate (see
+      `Request.satisfaction_ratio`), with the latest arrival time deciding any
+      ties. A request that declared no `target_rate` has an infinite ratio and
+      is preempted first. This is the default for `policy="waterfill"`."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to
@@ -245,6 +256,7 @@ class SchedulerConfig:
     _VICTIM_POLICY_DEFAULTS: ClassVar[dict[str, PreemptionVictimPolicy]] = {
         "fcfs": "tail",
         "priority": "priority",
+        "waterfill": "satisfaction",
     }
 
     def resolved_preemption_victim_policy(self) -> PreemptionVictimPolicy:

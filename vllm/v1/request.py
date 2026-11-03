@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+import math
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -20,6 +21,7 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
+from vllm.v1.engine.rate_control import resolve_target_rate
 from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.metrics.stats import PrefillStats, RequestSpecDecodeMetrics
 from vllm.v1.structured_output.request import StructuredOutputRequest
@@ -97,6 +99,8 @@ class Request:
                 reasoning_parser_kwargs
             )
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
+        # SLO output rate in tokens/s, -1.0 if the request declared none.
+        self.slo_rate: float = resolve_target_rate(sampling_params) or -1.0
 
         self.status = RequestStatus.WAITING
         self.events: list[EngineCoreEvent] = []
@@ -317,6 +321,24 @@ class Request:
     @property
     def num_output_tokens(self) -> int:
         return len(self._output_token_ids)
+
+    def satisfaction_ratio(self, now: float) -> float:
+        """Generated tokens over the tokens a reader consuming at the SLO rate
+        would have read since arrival.
+
+        Time spent queued counts against the request. Returns 0.0 if no time has
+        elapsed and infinity if the request declared no SLO rate.
+
+        Args:
+            now: Current time on the same `time.time()` clock as `arrival_time`.
+
+        """
+        if self.slo_rate <= 0:
+            return math.inf
+        elapsed = now - self.arrival_time
+        if elapsed <= 0:
+            return 0.0
+        return self.num_output_tokens / (elapsed * self.slo_rate)
 
     @property
     def num_encoder_inputs(self) -> int:
