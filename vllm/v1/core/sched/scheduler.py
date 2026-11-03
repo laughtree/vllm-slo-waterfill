@@ -52,6 +52,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
+    WaterfillRequestQueue,
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
@@ -793,6 +794,16 @@ class Scheduler(SchedulerInterface):
         ):
             defer_prefills = True
 
+        if self.policy == SchedulingPolicy.WATERFILL:
+            # Use one clock for the whole step: the admission loop peeks a waiting
+            # request and pops it later, and must see the same ordering.
+            now = time.time()
+            for queue in (self.waiting, self.kv_holding_waiting):
+                assert isinstance(queue, WaterfillRequestQueue)
+                queue.set_now(now)
+            # Hand the token budget to the least satisfied requests first.
+            self.running.sort(key=lambda r: (r.satisfaction_ratio(now), r.arrival_time))
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -931,20 +942,14 @@ class Scheduler(SchedulerInterface):
                         break
 
                     # The request cannot be scheduled.
-                    # Preempt the lowest-priority request.
-                    if self.preemption_victim_policy == "priority":
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
-                        )
-                    else:
-                        preempted_req = self.running[-1]
+                    # Preempt the request chosen by the victim policy.
+                    preempted_req = self._select_preemption_victim()
 
                     # A deferred free will not help with immediate allocation.
                     if not self._request_blocks_can_be_freed(preempted_req):
                         break
 
-                    if self.preemption_victim_policy == "priority":
+                    if self.preemption_victim_policy != "tail":
                         victim_index = self.running.index(preempted_req)
                         del self.running[victim_index]
                         if victim_index < req_index:
@@ -1798,6 +1803,23 @@ class Scheduler(SchedulerInterface):
         if not self.needs_kv_cache_zeroing:
             return None
         return new_block_ids_to_zero or None
+
+    def _select_preemption_victim(self) -> Request:
+        """Pick the running request to preempt under KV-cache pressure.
+
+        "tail" takes the most recently admitted request, "priority" the lowest
+        priority one, and "satisfaction" the one furthest ahead of its SLO output
+        rate. Ties go to the later arrival.
+        """
+        if self.preemption_victim_policy == "priority":
+            return max(self.running, key=lambda r: (r.priority, r.arrival_time))
+        if self.preemption_victim_policy == "satisfaction":
+            now = time.time()
+            return max(
+                self.running,
+                key=lambda r: (r.satisfaction_ratio(now), r.arrival_time),
+            )
+        return self.running[-1]
 
     def _preempt_request(
         self, request: Request, timestamp: float, drop_stale_output: bool = False
