@@ -21,7 +21,8 @@ from vllm.outputs import (
     SamplingMask,
     WeightVersionSpan,
 )
-from vllm.sampling_params import RequestOutputKind
+from vllm.pooling_params import PoolingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tracing import (
     SpanAttributes,
@@ -34,6 +35,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.engine.rate_control import resolve_chunk_size, resolve_target_rate
 from vllm.v1.metrics.stats import (
     IterationStats,
     LoRARequestStates,
@@ -158,6 +160,103 @@ class StreamingInputOutputCollector(RequestOutputCollector):
             self.output = self._backlog.popleft()
             self.ready.set()
         return output
+
+
+class RatedRequestOutputCollector(RequestOutputCollector):
+    """Collector that holds a request's output back for paced delivery.
+
+    The base collector merges everything the producer sends while the consumer
+    is behind into a single output. This one keeps the outputs in order and
+    returns at most `chunk_size` tokens per `get`, so a consumer that waits
+    between calls (see `RatePacer`) receives the tokens in even chunks. A
+    finished output or an exception is only returned once the buffered tokens
+    have been delivered.
+
+    Tokens are counted per output, so this collector assumes
+    `RequestOutputKind.DELTA` and `n == 1`.
+    """
+
+    def __init__(
+        self,
+        output_kind: RequestOutputKind,
+        request_id: str,
+        chunk_size: int,
+        target_rate: float,
+    ):
+        super().__init__(output_kind, request_id)
+        self.target_rate = target_rate
+        self._chunk_size = chunk_size
+        self._buffer: deque[RequestOutput] = deque()
+        self._terminal: RequestOutput | Exception | None = None
+
+    def put(self, output: RequestOutput | PoolingRequestOutput | Exception) -> None:
+        """Non-blocking put. Finished outputs and exceptions skip the buffer."""
+        assert not isinstance(output, PoolingRequestOutput)
+        if isinstance(output, Exception) or output.finished:
+            self._terminal = output
+        else:
+            self._buffer.append(output)
+        self.ready.set()
+
+    async def get(self) -> RequestOutput | PoolingRequestOutput:
+        """Get operation blocks until an output is available."""
+        while not self._buffer and self._terminal is None:
+            await self.ready.wait()
+        return self._drain()
+
+    def get_nowait(self) -> RequestOutput | PoolingRequestOutput | None:
+        """Non-blocking get operation."""
+        if not self._buffer and self._terminal is None:
+            return None
+        return self._drain()
+
+    def _drain(self) -> RequestOutput:
+        """Merge buffered outputs up to `chunk_size` tokens, or return the
+        terminal item once the buffer is empty."""
+        if not self._buffer:
+            terminal = self._terminal
+            self._terminal = None
+            self.ready.clear()
+            if isinstance(terminal, Exception):
+                raise terminal
+            assert terminal is not None
+            return terminal
+
+        merged = self._buffer.popleft()
+        num_tokens = self._num_tokens(merged)
+        while self._buffer and num_tokens < self._chunk_size:
+            nxt = self._buffer.popleft()
+            num_tokens += self._num_tokens(nxt)
+            merged.add(nxt, aggregate=self.aggregate)
+        if not self._buffer and self._terminal is None:
+            self.ready.clear()
+        return merged
+
+    @staticmethod
+    def _num_tokens(output: RequestOutput) -> int:
+        return len(output.outputs[0].token_ids) if output.outputs else 0
+
+
+def create_output_collector(
+    params: SamplingParams | PoolingParams, request_id: str
+) -> RequestOutputCollector:
+    """Create the collector for a request.
+
+    A request that declares a `target_rate` and streams deltas of a single
+    sequence gets a `RatedRequestOutputCollector`, so that its output can be
+    delivered at that rate. Any other request gets the base collector.
+    """
+    target_rate = resolve_target_rate(params)
+    if (
+        target_rate is not None
+        and isinstance(params, SamplingParams)
+        and params.n == 1
+        and params.output_kind == RequestOutputKind.DELTA
+    ):
+        return RatedRequestOutputCollector(
+            params.output_kind, request_id, resolve_chunk_size(params), target_rate
+        )
+    return RequestOutputCollector(params.output_kind, request_id)
 
 
 @dataclass

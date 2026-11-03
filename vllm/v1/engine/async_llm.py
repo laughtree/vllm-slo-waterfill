@@ -61,10 +61,13 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import (
     OutputProcessor,
+    RatedRequestOutputCollector,
     RequestOutputCollector,
     StreamingInputOutputCollector,
+    create_output_collector,
 )
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.engine.rate_control import RatePacer, resolve_pace
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
 from vllm.v1.kv_hints import KvHintsEnvelope
@@ -540,7 +543,7 @@ class AsyncLLM(EngineClient):
         self._run_output_handler()
 
         # Create a new output collector for the request.
-        queue = RequestOutputCollector(params.output_kind, request.request_id)
+        queue = create_output_collector(params, request.request_id)
 
         # Use cloned params that may have been updated in process_inputs()
         params = request.params
@@ -800,10 +803,22 @@ class AsyncLLM(EngineClient):
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
             )
 
+            # A paced request waits between deliveries so that its output
+            # buffers up into chunks and is released at its target rate.
+            pacer = (
+                RatePacer(q.target_rate)
+                if isinstance(q, RatedRequestOutputCollector)
+                and resolve_pace(sampling_params)
+                else None
+            )
+
             # The output_handler task pushes items into the queue.
             # This task pulls from the queue and yields to caller.
             finished = False
             while not finished:
+                if pacer is not None:
+                    await pacer.wait()
+
                 # Note: drain queue without await if possible (avoids
                 # task switching under load which helps performance).
                 out = q.get_nowait() or await q.get()
@@ -814,6 +829,8 @@ class AsyncLLM(EngineClient):
                 finished = out.finished
                 if out is not STREAM_FINISHED:
                     yield out
+                if pacer is not None and not finished:
+                    pacer.advance(len(out.outputs[0].token_ids) if out.outputs else 0)
 
         # If the request is disconnected by the client, generate()
         # is cancelled or the generator is garbage collected. So,
