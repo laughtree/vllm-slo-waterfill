@@ -262,19 +262,22 @@ def test_running_requests_are_sorted_by_ratio_each_step(frozen_clock):
         ("first-unrated", "first"),
     ],
 )
+@pytest.mark.parametrize("policy", ["waterfill", "fcfs"])
 def test_satisfaction_victim_is_the_request_furthest_ahead(
-    frozen_clock, ahead, expected_victim
+    frozen_clock, policy, ahead, expected_victim
 ):
     """`second` needs a new block while none is free, so one running request is
     preempted. Under "tail" that would always be `second`."""
     block_size = 16
     scheduler = create_scheduler(
-        scheduling_policy="waterfill",
+        scheduling_policy=policy,
         max_num_seqs=3,
         max_num_batched_tokens=200,
         num_blocks=6,  # 5 usable blocks
         block_size=block_size,
     )
+    # `create_scheduler` has no victim policy argument.
+    scheduler.preemption_victim_policy = "satisfaction"
     first, second = create_requests(
         num_requests=2, num_tokens=2 * block_size, req_ids=["first", "second"]
     )

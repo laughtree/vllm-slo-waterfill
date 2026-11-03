@@ -19,6 +19,73 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 ---
 
+## SLO-Aware Water-Filling Scheduling
+
+This fork adds a scheduling policy that serves each request "just enough" and spends the rest of the budget on requests that are falling behind. The rest of this README is upstream vLLM's.
+
+### Idea
+
+When the KV cache is over-subscribed, first-come-first-served leaves some requests fast and others starved. But clients do not consume output at the same speed: a person reads a chat reply at roughly 10 tokens/s, while an agent consumes everything at once. Tokens generated faster than they are read are wasted, so a request that is already ahead of its reader can wait while one that is behind gets the compute and the KV blocks.
+
+Each request declares the output rate it needs, its SLO rate `r`, and the scheduler tracks how well it is met with a **satisfaction ratio**:
+
+```text
+s = generated_tokens / ((now - arrival_time) * r)
+```
+
+`s = 1` means the request has produced exactly what a reader at rate `r` would have consumed since it arrived. Time spent queued counts against the request. Water-filling then raises the lowest `s` first, like pouring water into the lowest vessel:
+
+- **Running requests** are ordered by ascending `s`, so the token budget goes to the least satisfied.
+- **Waiting requests** are admitted by ascending `s`.
+- **On KV-cache pressure** the request with the largest `s`, the one furthest ahead, is preempted. Preemption recomputes, but the generated tokens are kept, so its `s` carries over.
+- A request that declares no rate has `s = inf`: it is admitted last and preempted first.
+
+### Design
+
+- **Scheduling policy and victim policy are separate.** `--scheduling-policy` decides which waiting request is admitted next. `--preemption-victim-policy` decides which running request is evicted. When the victim policy is not set it is derived from the scheduling policy, so existing `fcfs` and `priority` behavior is unchanged, and the two can be combined freely.
+
+  | `--scheduling-policy` | default `--preemption-victim-policy` |
+  | --- | --- |
+  | `fcfs` | `tail`: the most recently admitted request |
+  | `priority` | `priority`: the lowest-priority request |
+  | `waterfill` | `satisfaction`: the request with the largest `s` |
+
+- **Output pacing is independent of scheduling.** A streaming request with a `target_rate` has its output buffered by the server and released in chunks at that rate, so the client sees tokens when it needs them, not when the engine produced them. The scheduler reads `target_rate` from the request itself and does not depend on pacing.
+- **The queue ordering clock is pinned per step.** `s` changes with time, so the scheduler fixes one `now` per step for the waiting queues. Otherwise the request it peeks at could differ from the one it pops.
+
+| Where | What |
+| --- | --- |
+| `vllm/config/scheduler.py` | `waterfill` policy, `preemption_victim_policy` |
+| `vllm/v1/request.py` | `slo_rate`, `satisfaction_ratio()` |
+| `vllm/v1/core/sched/request_queue.py` | `WaterfillRequestQueue` |
+| `vllm/v1/core/sched/scheduler.py` | running order, `_select_preemption_victim()` |
+| `vllm/v1/engine/rate_control.py`, `output_processor.py`, `async_llm.py` | paced delivery |
+
+### Usage
+
+```bash
+vllm serve Qwen/Qwen2.5-1.5B-Instruct --scheduling-policy waterfill
+```
+
+Declare the SLO per request with `vllm_xargs`:
+
+```json
+{
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "messages": [{"role": "user", "content": "Hello"}],
+  "stream": true,
+  "vllm_xargs": {"target_rate": 10, "chunk_size": 8}
+}
+```
+
+| `vllm_xargs` | Meaning |
+| --- | --- |
+| `target_rate` | SLO output rate in tokens/s. Enables the satisfaction ratio and, for streaming deltas of one sequence (`n=1`), paced delivery. |
+| `chunk_size` | Most tokens sent in one paced chunk. Default 16. |
+| `pace` | `false` keeps the SLO for scheduling but delivers at full speed. |
+
+---
+
 ## About
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
