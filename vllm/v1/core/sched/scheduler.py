@@ -227,6 +227,10 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
+        # Which running request is evicted on KV-cache pressure.
+        self.preemption_victim_policy = (
+            self.scheduler_config.resolved_preemption_victim_policy()
+        )
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         # Waiting requests that hold KV blocks are always drained before
@@ -928,7 +932,7 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
+                    if self.preemption_victim_policy == "priority":
                         preempted_req = max(
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
@@ -940,7 +944,7 @@ class Scheduler(SchedulerInterface):
                     if not self._request_blocks_can_be_freed(preempted_req):
                         break
 
-                    if self.policy == SchedulingPolicy.PRIORITY:
+                    if self.preemption_victim_policy == "priority":
                         victim_index = self.running.index(preempted_req)
                         del self.running[victim_index]
                         if victim_index < req_index:
@@ -980,7 +984,7 @@ class Scheduler(SchedulerInterface):
 
             if new_blocks is None:
                 if (
-                    self.policy == SchedulingPolicy.PRIORITY
+                    self.preemption_victim_policy == "priority"
                     and request.status == RequestStatus.PREEMPTED
                 ):
                     # The request was the lowest-priority running request and

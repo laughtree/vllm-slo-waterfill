@@ -21,6 +21,7 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.config.scheduler import PreemptionVictimPolicy, SchedulerPolicy
 from vllm.config.watermarking import WatermarkConfig
 from vllm.distributed.aux_output_connector.connector import (
     AuxOutputSchedulerConnector,
@@ -4281,6 +4282,8 @@ def create_scheduler_with_priority(
     use_ec_connector: bool = False,
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
+    policy: SchedulerPolicy = "priority",
+    preemption_victim_policy: PreemptionVictimPolicy | None = None,
 ) -> Scheduler:
     """Create scheduler with priority policy enabled.
 
@@ -4291,6 +4294,8 @@ def create_scheduler_with_priority(
       enable_prefix_caching: optionally force APC config
                              (True/False) or use default
                              (False)
+      policy: admission scheduling policy
+      preemption_victim_policy: victim policy, derived from `policy` if None
 
     Returns:
       {class}`Scheduler` instance with priority scheduling
@@ -4312,7 +4317,8 @@ def create_scheduler_with_priority(
         disable_chunked_mm_input=disable_chunked_mm_input,
         enable_chunked_prefill=True,
         is_encoder_decoder=model_config.is_encoder_decoder,
-        policy="priority",  # Enable priority scheduling
+        policy=policy,
+        preemption_victim_policy=preemption_victim_policy,
         # Ensure admission/preemption mechanics are deterministic
         watermark=0.0,
     )
@@ -4678,6 +4684,92 @@ def test_priority_scheduling_preemption():
     assert any(req.request_id == "hi1" for req in scheduler.running), (
         "High-priority 'hi1' should still be running"
     )
+
+
+@pytest.mark.parametrize(
+    "policy, victim_policy, expected_default",
+    [
+        ("fcfs", None, "tail"),
+        ("priority", None, "priority"),
+        ("fcfs", "priority", "priority"),
+        ("priority", "tail", "tail"),
+    ],
+)
+def test_resolved_preemption_victim_policy(policy, victim_policy, expected_default):
+    """The victim policy follows `policy` unless it is set explicitly."""
+    scheduler = create_scheduler_with_priority(
+        policy=policy, preemption_victim_policy=victim_policy
+    )
+    assert scheduler.scheduler_config.resolved_preemption_victim_policy() == (
+        expected_default
+    )
+    assert scheduler.preemption_victim_policy == expected_default
+
+
+@pytest.mark.parametrize(
+    "policy, victim_policy, expected_victim",
+    [
+        ("priority", None, "lo1"),
+        ("fcfs", None, "hi1"),
+        # Admission order and victim choice are independent.
+        ("fcfs", "priority", "lo1"),
+        ("priority", "tail", "hi1"),
+    ],
+)
+def test_preemption_victim_independent_of_scheduling_policy(
+    policy, victim_policy, expected_victim
+):
+    """`lo1` (priority 5) runs before `hi1` (priority 0) and `hi1` then needs a
+    block that is not free. The victim is `lo1` for the "priority" victim policy
+    and the most recently admitted request `hi1` for "tail", whatever the
+    admission policy is.
+
+    Block math is that of `test_priority_scheduling_preemption`: block_size 16,
+    5 usable blocks, 32-token prompts.
+    """
+    block_size = 16
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=3,
+        max_num_batched_tokens=200,
+        num_blocks=6,
+        block_size=block_size,
+        policy=policy,
+        preemption_victim_policy=victim_policy,
+    )
+
+    def decode(req_ids):
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+                sampled_token_ids=[[100] for _ in req_ids],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    for priority, arrival_time, req_id in [(5, 1.0, "lo1"), (0, 2.0, "hi1")]:
+        scheduler.add_request(
+            create_requests_with_priority(
+                num_requests=1,
+                priorities=[priority],
+                arrival_times=[arrival_time],
+                num_tokens=block_size * 2,
+                req_ids=[req_id],
+            )[0]
+        )
+        output = scheduler.schedule()
+        decode([r.request_id for r in scheduler.running])
+
+    assert [r.request_id for r in scheduler.running] == ["lo1", "hi1"]
+
+    scheduler.schedule()
+
+    assert scheduler.requests[expected_victim].status == RequestStatus.PREEMPTED
+    survivor = "hi1" if expected_victim == "lo1" else "lo1"
+    assert scheduler.requests[survivor].status == RequestStatus.RUNNING
 
 
 def test_priority_scheduling_no_preemption_when_space_available():

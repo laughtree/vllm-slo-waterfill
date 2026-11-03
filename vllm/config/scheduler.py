@@ -19,6 +19,7 @@ logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority"]
+PreemptionVictimPolicy = Literal["tail", "priority"]
 
 
 @config
@@ -157,12 +158,25 @@ class SchedulerConfig:
     max_num_batched_tokens in case max multimodal embedding size is larger."""
 
     policy: SchedulerPolicy = "fcfs"
-    """The scheduling policy to use:
+    """The scheduling policy to use. It decides which waiting request is
+    admitted next; which running request is evicted under KV-cache pressure is
+    chosen separately by `preemption_victim_policy`:
 
-    - "fcfs" means first come first served, i.e. requests are handled in order 
+    - "fcfs" means first come first served, i.e. requests are handled in order
       of arrival.
     - "priority" means requests are handled based on given priority (lower
       value means earlier handling) and time of arrival deciding any ties)."""
+
+    preemption_victim_policy: PreemptionVictimPolicy | None = None
+    """Which running request is preempted when a request needs more KV-cache
+    blocks than are free. It is independent of `policy`. If unset, it is derived
+    from `policy` (see `resolved_preemption_victim_policy`):
+
+    - "tail" preempts the most recently admitted running request. This is the
+      default for `policy="fcfs"`.
+    - "priority" preempts the running request with the lowest priority (highest
+      priority value), with the latest arrival time deciding any ties. This is
+      the default for `policy="priority"`."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to
@@ -227,6 +241,17 @@ class SchedulerConfig:
         if "is_encoder_decoder" not in kwargs:
             kwargs["is_encoder_decoder"] = False
         return SchedulerConfig(**kwargs)
+
+    _VICTIM_POLICY_DEFAULTS: ClassVar[dict[str, PreemptionVictimPolicy]] = {
+        "fcfs": "tail",
+        "priority": "priority",
+    }
+
+    def resolved_preemption_victim_policy(self) -> PreemptionVictimPolicy:
+        """Return `preemption_victim_policy`, or the default for `policy`."""
+        if self.preemption_victim_policy is not None:
+            return self.preemption_victim_policy
+        return self._VICTIM_POLICY_DEFAULTS[self.policy]
 
     def get_scheduler_cls(self) -> type["SchedulerInterface"]:
         if self.scheduler_cls is None:
