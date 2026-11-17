@@ -84,6 +84,14 @@ Declare the SLO per request with `vllm_xargs`:
 | `chunk_size` | Most tokens sent in one paced chunk. Default 16. |
 | `pace` | `false` keeps the SLO for scheduling but delivers at full speed. |
 
+### Results
+
+The evaluation behind this scheduler (Qwen2.5-1.5B-Instruct, one RTX 5070 Laptop, KV budget 0.31 GiB, Azure conversation trace, mixed 30/10 tok/s SLOs) was run on the original project fork, not on this repository: vLLM upstream `25ce6f292` plus the project's commits, ending at `d659e977c`. That fork also contained experiments that are not part of this repository (the SLO-rate cap and water-level skip ablations, a headroom-based baseline, and other schedulers), so this repository is a clean port of the core logic onto a newer upstream (`77d2790e78`).
+
+In that evaluation, water-filling raised fairness over FCFS with newest-first eviction at every load from 0.75x of the measured knee upward (Jain index +0.068 at 1.5x and +0.072 at 2x, mixed SLOs, 3 of 3 repetitions). Attainment and goodput were higher near the knee and lower under heavy overload (about -0.03 to -0.08 attainment at 1.5x-2x), because max-min fairness does not maximise attainment under overload.
+
+A spot check of this repository (FCFS vs `waterfill`, 4 loads, 3 repetitions) reproduced the fairness gain in every repetition from 1x of the knee upward. Absolute numbers and the load at which the attainment advantage turns into a cost differ, since the engine underneath is a newer upstream: both policies perform better there. Treat the figures above as results of the original fork, and the direction of the effect as confirmed on this repository.
+
 ---
 
 ## About
